@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Perp Consolidation Detector — All USDT Perpetuals</title>
+  <title>Perp Consolidation Detector — All USDT Perpetuals (Fixed)</title>
   <style>
     body{font-family:Inter, Roboto, Arial; background:#0f1720; color:#e6eef8; margin:12px}
     .card{background:#0b1220;border-radius:10px;padding:12px;box-shadow:0 6px 20px rgba(0,0,0,0.5);max-width:1200px}
@@ -17,17 +17,14 @@
     .signal.bad{background:#3a0f0f;color:#ffbdbd}
     .row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
     .meta{margin-top:8px;color:#94a3b8;font-size:13px}
-    .status-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:middle}
-    .status-running{background:#22c55e}
-    .status-stopped{background:#ef4444}
-    .status-idle{background:#94a3b8}
+    .batch{margin-top:8px;padding:8px;border-radius:6px;background:#071827}
     .small{font-size:12px;color:#9fb5d6}
-    .summary{margin-top:8px;color:#9fb5d6;font-size:13px}
+    .green{color:#7ee787} .yellow{color:#ffd78a} .red{color:#ff9b9b}
   </style>
 </head>
 <body>
   <div class="card">
-    <h2>Perp Consolidation & Breakout Detector — All USDT Perpetuals (Demo)</h2>
+    <h2>Perp Consolidation & Breakout Detector — All USDT Perpetuals (Fixed)</h2>
 
     <div class="row">
       <label>Interval</label>
@@ -48,17 +45,17 @@
       <label>Batch size</label>
       <input id="batchSize" value="60" style="width:64px" />
 
-      <button id="start">Start (all USDT perp)</button>
+      <label>Max concurrent</label>
+      <input id="maxConcurrent" value="4" style="width:64px" />
+
+      <button id="startAll">Start (all)</button>
+      <button id="startTest">Start (test 6)</button>
       <button id="stop">Stop</button>
     </div>
 
     <div class="meta">
-      <div class="summary">
-        This demo will fetch the Binance futures exchange info, find symbols that are USDT perpetual contracts, then open combined websocket streams in batches.
-      </div>
-      <div style="margin-top:6px">
-        <span id="info" class="small"></span>
-      </div>
+      <div class="small" id="info">Loaded — click Start (test 6) to verify quickly.</div>
+      <div id="batchesContainer"></div>
     </div>
 
     <div class="log" id="log"></div>
@@ -70,15 +67,33 @@
   const logEl = document.getElementById('log');
   const signalsEl = document.getElementById('signals');
   const infoEl = document.getElementById('info');
-  let connections = []; // {ws, batchSymbols, url}
+  const batchesContainer = document.getElementById('batchesContainer');
+
   let running = false;
+  let connections = []; // objects: { ws, batch, statusEl, store }
   let allSymbols = [];
 
   function now(){ return new Date().toLocaleTimeString(); }
-  function uiLog(msg){ logEl.innerHTML = `<div>[${now()}] ${msg}</div>` + logEl.innerHTML; console.log(msg); }
-  function setSignal(msg, level='ok'){ const el=document.createElement('div'); el.className=`signal ${level}`; el.textContent=`${now()} — ${msg}`; signalsEl.prepend(el); console.log('signal', level, msg); }
+  function uiLog(msg, level='info'){
+    const line = document.createElement('div');
+    line.innerHTML = `<span class="small">[${now()}]</span> ${msg}`;
+    if(level==='warn') line.classList.add('yellow');
+    if(level==='err') line.classList.add('red');
+    logEl.prepend(line);
+    console.log(msg);
+    // keep log length manageable
+    while(logEl.childNodes.length > 500) logEl.removeChild(logEl.lastChild);
+  }
 
-  // small indicators & analysis functions (same as earlier)
+  function setSignal(msg, level='ok'){
+    const el = document.createElement('div');
+    el.className = `signal ${level}`;
+    el.textContent = `${now()} — ${msg}`;
+    signalsEl.prepend(el);
+    while(signalsEl.childNodes.length > 200) signalsEl.removeChild(signalsEl.lastChild);
+  }
+
+  // indicators (same as before)
   function ema(values, period){
     if(!Array.isArray(values) || values.length===0) return null;
     const k = 2/(period+1);
@@ -120,72 +135,90 @@
   function rangeFromCandles(candles){ const highs=candles.map(c=>parseFloat(c.h)); const lows=candles.map(c=>parseFloat(c.l)); return {res:Math.max(...highs), sup:Math.min(...lows)}; }
   function volMA(candles, n=20){ if(!candles || candles.length===0) return 0; const vols=candles.map(c=>parseFloat(c.v)); const sub=vols.slice(-n); return sub.reduce((a,b)=>a+b,0)/sub.length; }
 
-  // fetch exchange info and filter perp USDT symbols
+  // fetch symbols
   async function fetchPerpSymbols(){
     const url = 'https://fapi.binance.com/fapi/v1/exchangeInfo';
     uiLog('Fetching exchange info from Binance...');
-    const resp = await fetch(url);
-    if(!resp.ok) throw new Error('exchangeInfo fetch failed: ' + resp.status);
-    const json = await resp.json();
-    // filter symbols: contractType PERPETUAL; symbol endsWith USDT
-    // NOTE: exchangeInfo for futures contains contracts entries under symbols array, with contractType property for each symbol
-    const syms = json.symbols.filter(s => {
-      // For Binance futures exchangeInfo, `symbol` typically present. There may also be `contractType` in the query param; if not, fallback to naming convention
-      const isUSDT = s.symbol && s.symbol.toUpperCase().endsWith('USDT');
-      const isPerp = (s.contractType && s.contractType.toUpperCase()==='PERPETUAL') || (s.contractType === undefined && s.symbol && s.symbol.toUpperCase().endsWith('USDT'));
-      return isUSDT && isPerp;
-    }).map(s => s.symbol.toLowerCase());
-    return syms;
+    try{
+      const resp = await fetch(url);
+      if(!resp.ok) throw new Error('exchangeInfo fetch failed: ' + resp.status);
+      const json = await resp.json();
+      const syms = json.symbols.filter(s => {
+        const isUSDT = s.symbol && s.symbol.toUpperCase().endsWith('USDT');
+        const isPerp = (s.contractType && s.contractType.toUpperCase()==='PERPETUAL') || (s.contractType === undefined && s.symbol && s.symbol.toUpperCase().endsWith('USDT'));
+        return isUSDT && isPerp;
+      }).map(s=>s.symbol.toLowerCase());
+      return syms;
+    }catch(err){
+      uiLog('Failed to fetch exchangeInfo: ' + (err.message||err),'err');
+      throw err;
+    }
   }
 
-  // split into batches
-  function splitBatches(arr, size){
-    const out=[];
-    for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i,i+size));
-    return out;
+  // create batch UI element
+  function createBatchEl(batchIdx, symbols){
+    const el = document.createElement('div');
+    el.className = 'batch';
+    el.innerHTML = `<div><strong>Batch ${batchIdx}</strong> — ${symbols.length} symbols</div><div class="small" id="batch-${batchIdx}-status">status: waiting</div>`;
+    batchesContainer.appendChild(el);
+    return el.querySelector(`#batch-${batchIdx}-status`);
   }
 
-  // create combined ws for a batch of symbols for the selected interval
-  function createWsForBatch(symbolBatch, interval, stdTh, lookback){
-    // build streams like btcusdt@kline_1m/ethusdt@kline_1m
+  // create ws for batch with status element and internal stores
+  function createWsForBatch(symbolBatch, interval, stdTh, lookback, batchIdx){
     const streamNames = symbolBatch.map(s => `${s}@kline_${interval}`).join('/');
     const url = `wss://fstream.binance.com/stream?streams=${streamNames}`;
-    uiLog(`Opening WS for batch (${symbolBatch.length}) ...`);
+    const statusEl = createBatchEl(batchIdx, symbolBatch);
+    uiLog(`(batch ${batchIdx}) opening WS ...`);
+    statusEl.textContent = 'status: connecting';
     const ws = new WebSocket(url);
-    const candleStores = {}; // symbol -> list of recent candles
-    ws.onopen = ()=> uiLog(`WS OPEN (batch size ${symbolBatch.length})`);
-    ws.onerror = (e)=> uiLog('WS ERROR (batch) - check console');
-    ws.onclose = (ev)=> uiLog(`WS CLOSED (batch). code=${ev.code}`);
+    const store = {}; // symbol -> candles array
+
+    // heartbeat counter for visibility
+    let messagesSeen = 0;
+    let lastHeartbeat = Date.now();
+
+    ws.onopen = ()=> { uiLog(`(batch ${batchIdx}) WS open`); statusEl.textContent = 'status: open'; };
+    ws.onerror = (e)=> { uiLog(`(batch ${batchIdx}) WS error - check console`, 'err'); statusEl.textContent = 'status: error'; console.error(e); };
+    ws.onclose = (ev)=> { uiLog(`(batch ${batchIdx}) WS closed (code ${ev.code})`); statusEl.textContent = 'status: closed'; };
+
     ws.onmessage = (evt)=>{
       try{
         const d = JSON.parse(evt.data);
-        // combined stream message shape: {stream: 'btcusdt@kline_5m', data: {k: {...}}}
-        const stream = d.stream;
+        messagesSeen++;
+        // combined stream: {stream, data}
+        const stream = d.stream || (d.data && d.data.s ? `${d.data.s}@kline` : null);
         const payload = d.data;
         if(!payload || !payload.k) return;
         const k = payload.k;
         const sym = (stream.split('@')[0]).toLowerCase();
         const candle = {t:k.t, o:k.o, h:k.h, l:k.l, c:k.c, v:k.v, isFinal:k.x};
-        if(!candleStores[sym]) candleStores[sym] = [];
-        const store = candleStores[sym];
-        if(store.length===0 || store[store.length-1].t !== candle.t){
-          store.push(candle);
-          if(store.length>500) store.shift();
+        if(!store[sym]) store[sym]=[];
+        const arr = store[sym];
+        if(arr.length===0 || arr[arr.length-1].t !== candle.t){
+          arr.push(candle);
+          if(arr.length>500) arr.shift();
         } else {
-          store[store.length-1] = candle;
+          arr[arr.length-1] = candle;
         }
+
+        // only closed candles
         if(!candle.isFinal) return;
-        if(store.length < lookback) return;
-        const recent = store.slice(-lookback);
+
+        // ensure enough candles
+        if(arr.length < lookback) return;
+
+        // analyze
+        const recent = arr.slice(-lookback);
         const cons = detectConsolidation(recent, stdTh);
         const r = rangeFromCandles(recent);
-        const vMA = volMA(store, Math.min(40, store.length));
+        const vMA = volMA(arr, Math.min(40, arr.length));
         const lastClose = parseFloat(candle.c);
         const lastVol = parseFloat(candle.v);
 
+        // only emit consolidation & breakout (to avoid noise)
         if(cons.consolidation){
-          setSignal(`${sym.toUpperCase()} consolidation: ${r.sup.toFixed(6)} - ${r.res.toFixed(6)} (std:${cons.relativeStd.toFixed(6)})`,'warn');
-          // optionally persist snapshot: localStorage.setItem(...)
+          setSignal(`${sym.toUpperCase()} consolidation ${r.sup.toFixed(6)} - ${r.res.toFixed(6)} (std:${cons.relativeStd.toFixed(6)})`,'warn');
         }
 
         const breakoutBuffer = 0.0005;
@@ -198,62 +231,107 @@
           setSignal(`${sym.toUpperCase()} breakout price but weak vol. lastVol ${Math.round(lastVol)} vMA ${Math.round(vMA)}`,'warn');
         }
 
-      }catch(err){ console.error('batch message parse error', err); }
+        // heartbeat status update every ~15s
+        if(Date.now() - lastHeartbeat > 15000){
+          statusEl.textContent = `status: open · msgs:${messagesSeen}`;
+          lastHeartbeat = Date.now();
+        }
+      }catch(err){
+        console.error('batch parse error', err);
+      }
     };
-    return {ws, url, batchSymbols: symbolBatch};
+
+    return {ws, url, batchSymbols:symbolBatch, statusEl, store};
   }
 
-  async function startAll(){
-    if(running) { uiLog('Already running'); return; }
-    uiLog('Starting full symbols detector...');
-    setTimeout(()=>window.scrollTo(0,0), 100);
+  // split batches
+  function splitBatches(arr, size){ const out=[]; for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i,i+size)); return out; }
+
+  // start test (first N symbols) or all
+  async function start(useTest){
+    if(running){ uiLog('Already running — stop first','warn'); return; }
+    uiLog('Starting detector (fetching symbols) ...');
+    batchesContainer.innerHTML = '';
+    signalsEl.innerHTML = '';
+    logEl.innerHTML = '';
     try{
       allSymbols = await fetchPerpSymbols();
-      if(!allSymbols || allSymbols.length===0) { uiLog('No symbols found.'); return; }
-      uiLog(`Found ${allSymbols.length} USDT perpetual symbols (first 10): ${allSymbols.slice(0,10).map(s=>s.toUpperCase()).join(', ')}`);
+      uiLog(`Fetched ${allSymbols.length} perp-USDT symbols.`);
       infoEl.textContent = `Found ${allSymbols.length} symbols.`;
     }catch(err){
-      uiLog('Failed to fetch symbols: ' + err.message);
+      uiLog('Cannot start — exchangeInfo fetch failed. Serve file over http and check CORS/network.', 'err');
       return;
     }
 
     const interval = document.getElementById('interval').value || '5m';
-    const lookback = parseInt(document.getElementById('lookback').value)||24;
+    const lookback = Math.max(6, parseInt(document.getElementById('lookback').value)||24);
     const stdTh = parseFloat(document.getElementById('stdTh').value)||0.004;
-    const batchSize = Math.max(8, parseInt(document.getElementById('batchSize').value)||60); // avoid tiny batch
+    const batchSize = Math.max(6, parseInt(document.getElementById('batchSize').value)||60);
+    const maxConcurrent = Math.max(1, parseInt(document.getElementById('maxConcurrent').value)||4);
 
-    const batches = splitBatches(allSymbols, batchSize);
-    uiLog(`Creating ${batches.length} websocket connections (batchSize ${batchSize}).`);
-
-    // close previous conns if any
-    stopAll();
-
-    // create all connections
-    for(const batch of batches){
-      try{
-        const conn = createWsForBatch(batch, interval, stdTh, lookback);
-        connections.push(conn);
-      }catch(e){
-        uiLog('Failed to open batch WS: ' + e.message);
-      }
+    let batches = splitBatches(allSymbols, batchSize);
+    if(useTest){
+      // use only first batch and limit to 6 symbols (fast verification)
+      const sample = allSymbols.slice(0,6);
+      batches = [sample];
+      uiLog('Running in TEST mode (first 6 symbols).');
+    } else {
+      uiLog(`Creating ${batches.length} batches (batchSize ${batchSize}, maxConcurrent ${maxConcurrent})`);
     }
+
+    // open batches gradually, maxConcurrent at a time
     running = true;
-    uiLog('All batch connections started. Monitor signals above.');
+    connections = [];
+    let idx = 0;
+    async function openNextBatch(){
+      if(!running) return;
+      if(idx >= batches.length) {
+        uiLog('All requested batches scheduled.');
+        return;
+      }
+      const nextBatches = [];
+      for(let c=0; c<maxConcurrent && idx < batches.length; c++, idx++){
+        nextBatches.push({batchIdx: idx+1, symbols: batches[idx]});
+      }
+      // open these concurrently
+      for(const b of nextBatches){
+        try{
+          const conn = createWsForBatch(b.symbols, interval, stdTh, lookback, b.batchIdx);
+          connections.push(conn);
+          // small delay between opens to reduce burst
+          await new Promise(r=>setTimeout(r, 700));
+        }catch(err){
+          uiLog(`Failed to open batch ${b.batchIdx}: ${err.message}`,'err');
+        }
+      }
+      // schedule next open after a short pause
+      if(idx < batches.length) setTimeout(openNextBatch, 1500);
+    }
+    openNextBatch();
+
+    // periodic heartbeat so UI shows alive even if no detections
+    const hb = setInterval(()=>{
+      if(!running) clearInterval(hb);
+      uiLog(`Heartbeat — active connections: ${connections.length}`);
+    }, 45000);
   }
 
-  function stopAll(){
+  // stop everything
+  function stop(){
     running = false;
     for(const c of connections){
       try{ if(c.ws && c.ws.readyState === WebSocket.OPEN) c.ws.close(); }catch(e){}
+      if(c.statusEl && c.statusEl.parentNode) c.statusEl.parentNode.remove();
     }
     connections = [];
     uiLog('Stopped all connections.');
   }
 
-  document.getElementById('start').onclick = startAll;
-  document.getElementById('stop').onclick = stopAll;
+  document.getElementById('startAll').onclick = ()=>start(false);
+  document.getElementById('startTest').onclick = ()=>start(true);
+  document.getElementById('stop').onclick = stop;
 
-  uiLog('Loaded. Click Start to begin fetching & subscribing to all USDT perpetual symbols.');
+  uiLog('Detector ready. Click "Start (test 6)" to verify quickly. If nothing appears, open DevTools → Console and paste the first errors here.');
 })();
 </script>
 </body>

@@ -2358,12 +2358,7 @@ try {
 
 
 /* UI events */
-  // wire buttons (call after DOM ready)
-// Sorting controls: re-render on change
-el.sortField.addEventListener('change', ()=>{ if(window.lastResults) renderResults(window.lastResults); });
-el.sortOrder.addEventListener('change', ()=>{ if(window.lastResults) renderResults(window.lastResults); });
-  
-  
+  // wire buttons (call after DOM ready) 
 el.scanTopGreenBtn = document.getElementById('scanTopGreenBtn');
 el.scanTopRedBtn   = document.getElementById('scanTopRedBtn');
 el.scanStatus = document.getElementById('scanStatus');
@@ -2390,8 +2385,16 @@ el.startBtn.addEventListener('click', ()=>{ if(running) return; prevBlowoffSet =
 el.stopBtn.addEventListener('click', ()=>{ running=false; queue=[]; el.startBtn.disabled=false; el.stopBtn.disabled=true; if(autoTimer) clearTimeout(autoTimer); if(countdownTimer) clearInterval(countdownTimer); el.countdown.innerText='Next scan in: -'; el.message.innerText='Stopped.'; });
 el.oneShot.addEventListener('click', ()=>{ if(running) return; runScan(true); });
 el.sensitivity.addEventListener('input', ()=>{ el.sensVal.innerText = el.sensitivity.value; });
+
+  // Sorting controls: re-render on change
+el.sortField.addEventListener('change', ()=>{ if(window.lastResults) renderResults(window.lastResults); });
+el.sortOrder.addEventListener('change', ()=>{ if(window.lastResults) renderResults(window.lastResults); });
+  
 if('Notification' in window){ try{ Notification.requestPermission().catch(()=>{}); } catch(e){} }
 (async function ping(){ try{ await fetch(API_BASE + '/fapi/v1/ping'); } catch(e){ console.warn('ping failed', e); } })();
+
+  
+  
 
 </script>
 

@@ -3,335 +3,264 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Perp Consolidation Detector — All USDT Perpetuals (Fixed)</title>
+  <title>1D Previous Doji Detector — Binance Futures USDT Perpetuals (Safe)</title>
   <style>
     body{font-family:Inter, Roboto, Arial; background:#0f1720; color:#e6eef8; margin:12px}
-    .card{background:#0b1220;border-radius:10px;padding:12px;box-shadow:0 6px 20px rgba(0,0,0,0.5);max-width:1200px}
+    .card{background:#0b1220;border-radius:10px;padding:12px;box-shadow:0 6px 20px rgba(0,0,0,0.5);max-width:1100px}
     label,input,button,select{font-size:14px}
     input,select{padding:6px;margin-right:6px;background:#071021;border:1px solid #172033;color:#d6e7ff;border-radius:6px}
     button{padding:8px 10px;border-radius:8px;border:none;background:#1f8cff;color:#fff;cursor:pointer}
     .log{background:#06121a;padding:8px;border-radius:6px;margin-top:10px;min-height:160px;overflow:auto}
-    .signal{padding:8px;border-radius:6px;margin-top:8px}
-    .signal.ok{background:#08331a;color:#a6f7be}
-    .signal.warn{background:#3a2a0f;color:#ffd9a5}
-    .signal.bad{background:#3a0f0f;color:#ffbdbd}
+    .result{padding:8px;border-radius:6px;margin-top:8px}
+    .result.doji{background:#08331a;color:#a6f7be}
+    .result.no{background:#3a0f0f;color:#ffbdbd}
     .row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
     .meta{margin-top:8px;color:#94a3b8;font-size:13px}
-    .batch{margin-top:8px;padding:8px;border-radius:6px;background:#071827}
     .small{font-size:12px;color:#9fb5d6}
-    .green{color:#7ee787} .yellow{color:#ffd78a} .red{color:#ff9b9b}
+    .controls{margin-top:10px}
+    .summary{margin-top:8px;color:#9fb5d6;font-size:13px}
   </style>
 </head>
 <body>
   <div class="card">
-    <h2>Perp Consolidation & Breakout Detector — All USDT Perpetuals (Fixed)</h2>
+    <h2>1D Previous Doji Detector — Binance Futures (USDT Perps)</h2>
 
-    <div class="row">
-      <label>Interval</label>
-      <select id="interval">
-        <option value="1m">1m</option>
-        <option value="3m">3m</option>
-        <option value="5m" selected>5m</option>
-        <option value="15m">15m</option>
-        <option value="1h">1h</option>
-      </select>
+    <div class="row controls">
+      <label>Batch size (symbols/request batch)</label>
+      <input id="batchSize" value="30" style="width:80px" />
 
-      <label>Lookback</label>
-      <input id="lookback" value="24" style="width:64px" />
+      <label>Concurrency (parallel REST batches)</label>
+      <input id="concurrency" value="3" style="width:60px" />
 
-      <label>StdTh</label>
-      <input id="stdTh" value="0.004" style="width:80px" />
+      <label>Delay ms between batches</label>
+      <input id="delayMs" value="600" style="width:80px" />
 
-      <label>Batch size</label>
-      <input id="batchSize" value="60" style="width:64px" />
+      <label>Body/Range ratio (max)</label>
+      <input id="bodyRangeMax" value="0.25" style="width:80px" />
 
-      <label>Max concurrent</label>
-      <input id="maxConcurrent" value="4" style="width:64px" />
+      <label>Body/Price pct (max)</label>
+      <input id="bodyPriceMax" value="0.002" style="width:80px" />
 
-      <button id="startAll">Start (all)</button>
       <button id="startTest">Start (test 6)</button>
+      <button id="startAll">Start (all)</button>
       <button id="stop">Stop</button>
     </div>
 
     <div class="meta">
-      <div class="small" id="info">Loaded — click Start (test 6) to verify quickly.</div>
-      <div id="batchesContainer"></div>
+      <div class="summary">This tool checks the previous closed 1D candle (via REST klines) for a doji using two thresholds you can tweak: <em>bodyRangeMax</em> = max(body / (high-low)) and <em>bodyPriceMax</em> = max(body / meanPrice. Processing is throttled to stay safe for Binance rate limits.</div>
+      <div style="margin-top:6px" id="info" class="small">Loaded — click Start (test 6) to verify quickly.</div>
     </div>
 
     <div class="log" id="log"></div>
-    <div id="signals"></div>
+    <div id="results"></div>
   </div>
 
 <script>
 (function(){
   const logEl = document.getElementById('log');
-  const signalsEl = document.getElementById('signals');
+  const resultsEl = document.getElementById('results');
   const infoEl = document.getElementById('info');
-  const batchesContainer = document.getElementById('batchesContainer');
 
   let running = false;
-  let connections = []; // objects: { ws, batch, statusEl, store }
-  let allSymbols = [];
+  let abortRequested = false;
 
   function now(){ return new Date().toLocaleTimeString(); }
-  function uiLog(msg, level='info'){
-    const line = document.createElement('div');
-    line.innerHTML = `<span class="small">[${now()}]</span> ${msg}`;
-    if(level==='warn') line.classList.add('yellow');
-    if(level==='err') line.classList.add('red');
-    logEl.prepend(line);
+  function uiLog(msg, err=false){
+    const div = document.createElement('div');
+    div.innerHTML = `<span class="small">[${now()}]</span> ${msg}`;
+    if(err) div.style.color = '#ff9b9b';
+    logEl.prepend(div);
+    while(logEl.childNodes.length > 400) logEl.removeChild(logEl.lastChild);
     console.log(msg);
-    // keep log length manageable
-    while(logEl.childNodes.length > 500) logEl.removeChild(logEl.lastChild);
   }
-
-  function setSignal(msg, level='ok'){
+  function showResult(text, isDoji){
     const el = document.createElement('div');
-    el.className = `signal ${level}`;
-    el.textContent = `${now()} — ${msg}`;
-    signalsEl.prepend(el);
-    while(signalsEl.childNodes.length > 200) signalsEl.removeChild(signalsEl.lastChild);
+    el.className = 'result ' + (isDoji ? 'doji' : 'no');
+    el.textContent = `${now()} — ${text}`;
+    resultsEl.prepend(el);
+    while(resultsEl.childNodes.length > 500) resultsEl.removeChild(resultsEl.lastChild);
   }
 
-  // indicators (same as before)
-  function ema(values, period){
-    if(!Array.isArray(values) || values.length===0) return null;
-    const k = 2/(period+1);
-    let emaPrev = values[0];
-    for(let i=1;i<values.length;i++) emaPrev = values[i]*k + emaPrev*(1-k);
-    return emaPrev;
-  }
-  function atr(candles, period=14){
-    if(!candles || candles.length<=1) return 0;
-    let trs=[];
-    for(let i=1;i<candles.length;i++){
-      const high = parseFloat(candles[i].h);
-      const low = parseFloat(candles[i].l);
-      const prevClose = parseFloat(candles[i-1].c);
-      const tr = Math.max(high-low, Math.abs(high-prevClose), Math.abs(low-prevClose));
-      trs.push(tr);
-    }
-    if(trs.length === 0) return 0;
-    const sub = trs.slice(-period);
-    return sub.reduce((a,b)=>a+b,0)/sub.length;
-  }
-  function detectConsolidation(candles, stdTh=0.004){
-    const closes = candles.map(c=>parseFloat(c.c));
-    const mean = closes.reduce((a,b)=>a+b,0)/closes.length;
-    const diffs = closes.map(v=>v-mean);
-    const variance = diffs.reduce((a,b)=>a+b*b,0)/closes.length;
-    const std = Math.sqrt(variance);
-    const relativeStd = std/mean;
-    const myAtr = atr(candles, Math.min(14, candles.length-1));
-    const relativeAtr = myAtr/mean;
-    const shortE = ema(closes.slice(-10), 5);
-    const longE = ema(closes.slice(-20), 10) || shortE;
-    const emaSpread = Math.abs(shortE-longE)/mean;
-    const isStdTight = relativeStd < stdTh;
-    const isAtrLow = relativeAtr < Math.max(stdTh*1.5, 0.005);
-    const isEmaCompressed = emaSpread < stdTh*1.5;
-    return { consolidation: isStdTight && isAtrLow && isEmaCompressed, relativeStd, relativeAtr, emaSpread, mean, std };
-  }
-  function rangeFromCandles(candles){ const highs=candles.map(c=>parseFloat(c.h)); const lows=candles.map(c=>parseFloat(c.l)); return {res:Math.max(...highs), sup:Math.min(...lows)}; }
-  function volMA(candles, n=20){ if(!candles || candles.length===0) return 0; const vols=candles.map(c=>parseFloat(c.v)); const sub=vols.slice(-n); return sub.reduce((a,b)=>a+b,0)/sub.length; }
-
-  // fetch symbols
+  // Fetch list of USDT perpetual symbols from exchange info
   async function fetchPerpSymbols(){
     const url = 'https://fapi.binance.com/fapi/v1/exchangeInfo';
-    uiLog('Fetching exchange info from Binance...');
-    try{
-      const resp = await fetch(url);
-      if(!resp.ok) throw new Error('exchangeInfo fetch failed: ' + resp.status);
-      const json = await resp.json();
-      const syms = json.symbols.filter(s => {
-        const isUSDT = s.symbol && s.symbol.toUpperCase().endsWith('USDT');
-        const isPerp = (s.contractType && s.contractType.toUpperCase()==='PERPETUAL') || (s.contractType === undefined && s.symbol && s.symbol.toUpperCase().endsWith('USDT'));
-        return isUSDT && isPerp;
-      }).map(s=>s.symbol.toLowerCase());
-      return syms;
-    }catch(err){
-      uiLog('Failed to fetch exchangeInfo: ' + (err.message||err),'err');
-      throw err;
-    }
+    uiLog('Fetching exchangeInfo...');
+    const resp = await fetch(url);
+    if(!resp.ok) throw new Error('exchangeInfo fetch failed: ' + resp.status);
+    const json = await resp.json();
+    const syms = json.symbols.filter(s => {
+      const isUSDT = s.symbol && s.symbol.toUpperCase().endsWith('USDT');
+      const isPerp = (s.contractType && s.contractType.toUpperCase()==='PERPETUAL') || (s.contractType === undefined && s.symbol && s.symbol.toUpperCase().endsWith('USDT'));
+      return isUSDT && isPerp;
+    }).map(s => s.symbol.toUpperCase());
+    return syms;
   }
 
-  // create batch UI element
-  function createBatchEl(batchIdx, symbols){
-    const el = document.createElement('div');
-    el.className = 'batch';
-    el.innerHTML = `<div><strong>Batch ${batchIdx}</strong> — ${symbols.length} symbols</div><div class="small" id="batch-${batchIdx}-status">status: waiting</div>`;
-    batchesContainer.appendChild(el);
-    return el.querySelector(`#batch-${batchIdx}-status`);
+  // Fetch last N daily klines for a symbol; returns array of [openTime, open, high, low, close, ...]
+  async function fetchDailyKlines(symbol, limit=3){
+    const base = 'https://fapi.binance.com/fapi/v1/klines';
+    const params = `?symbol=${encodeURIComponent(symbol)}&interval=1d&limit=${limit}`;
+    const resp = await fetch(base + params);
+    if(!resp.ok) throw new Error(`klines fetch failed ${symbol}: ${resp.status}`);
+    const json = await resp.json();
+    // each item: [ openTime, open, high, low, close, volume, closeTime, ... ]
+    return json;
   }
 
-  // create ws for batch with status element and internal stores
-  function createWsForBatch(symbolBatch, interval, stdTh, lookback, batchIdx){
-    const streamNames = symbolBatch.map(s => `${s}@kline_${interval}`).join('/');
-    const url = `wss://fstream.binance.com/stream?streams=${streamNames}`;
-    const statusEl = createBatchEl(batchIdx, symbolBatch);
-    uiLog(`(batch ${batchIdx}) opening WS ...`);
-    statusEl.textContent = 'status: connecting';
-    const ws = new WebSocket(url);
-    const store = {}; // symbol -> candles array
+  // doji detection logic for a single closed daily candle array item
+  // Returns {isDoji, details}
+  function isDojiFromKline(kline, bodyRangeMax, bodyPriceMax){
+    // kline: [openTime, open, high, low, close, volume, closeTime, ...]
+    const open = parseFloat(kline[1]);
+    const high = parseFloat(kline[2]);
+    const low = parseFloat(kline[3]);
+    const close = parseFloat(kline[4]);
+    const meanPrice = (high + low + close + open)/4;
 
-    // heartbeat counter for visibility
-    let messagesSeen = 0;
-    let lastHeartbeat = Date.now();
+    const body = Math.abs(close - open);
+    const range = high - low || 1e-12;
+    const bodyRangeRatio = body / range;
+    const bodyPricePct = body / meanPrice;
 
-    ws.onopen = ()=> { uiLog(`(batch ${batchIdx}) WS open`); statusEl.textContent = 'status: open'; };
-    ws.onerror = (e)=> { uiLog(`(batch ${batchIdx}) WS error - check console`, 'err'); statusEl.textContent = 'status: error'; console.error(e); };
-    ws.onclose = (ev)=> { uiLog(`(batch ${batchIdx}) WS closed (code ${ev.code})`); statusEl.textContent = 'status: closed'; };
+    // small body relative to full range AND small in absolute price percent
+    const isDoji = (bodyRangeRatio <= bodyRangeMax) && (bodyPricePct <= bodyPriceMax);
 
-    ws.onmessage = (evt)=>{
-      try{
-        const d = JSON.parse(evt.data);
-        messagesSeen++;
-        // combined stream: {stream, data}
-        const stream = d.stream || (d.data && d.data.s ? `${d.data.s}@kline` : null);
-        const payload = d.data;
-        if(!payload || !payload.k) return;
-        const k = payload.k;
-        const sym = (stream.split('@')[0]).toLowerCase();
-        const candle = {t:k.t, o:k.o, h:k.h, l:k.l, c:k.c, v:k.v, isFinal:k.x};
-        if(!store[sym]) store[sym]=[];
-        const arr = store[sym];
-        if(arr.length===0 || arr[arr.length-1].t !== candle.t){
-          arr.push(candle);
-          if(arr.length>500) arr.shift();
-        } else {
-          arr[arr.length-1] = candle;
-        }
-
-        // only closed candles
-        if(!candle.isFinal) return;
-
-        // ensure enough candles
-        if(arr.length < lookback) return;
-
-        // analyze
-        const recent = arr.slice(-lookback);
-        const cons = detectConsolidation(recent, stdTh);
-        const r = rangeFromCandles(recent);
-        const vMA = volMA(arr, Math.min(40, arr.length));
-        const lastClose = parseFloat(candle.c);
-        const lastVol = parseFloat(candle.v);
-
-        // only emit consolidation & breakout (to avoid noise)
-        if(cons.consolidation){
-          setSignal(`${sym.toUpperCase()} consolidation ${r.sup.toFixed(6)} - ${r.res.toFixed(6)} (std:${cons.relativeStd.toFixed(6)})`,'warn');
-        }
-
-        const breakoutBuffer = 0.0005;
-        const isBreakout = lastClose > r.res*(1+breakoutBuffer);
-        const volConfirm = lastVol > Math.max(1.2*vMA, vMA + vMA*0.05);
-
-        if(isBreakout && volConfirm){
-          setSignal(`${sym.toUpperCase()} BREAKOUT confirmed. close ${lastClose.toFixed(6)} > ${r.res.toFixed(6)} vol ${Math.round(lastVol)}`,'ok');
-        } else if(isBreakout && !volConfirm){
-          setSignal(`${sym.toUpperCase()} breakout price but weak vol. lastVol ${Math.round(lastVol)} vMA ${Math.round(vMA)}`,'warn');
-        }
-
-        // heartbeat status update every ~15s
-        if(Date.now() - lastHeartbeat > 15000){
-          statusEl.textContent = `status: open · msgs:${messagesSeen}`;
-          lastHeartbeat = Date.now();
-        }
-      }catch(err){
-        console.error('batch parse error', err);
-      }
-    };
-
-    return {ws, url, batchSymbols:symbolBatch, statusEl, store};
+    return { isDoji, body, range, bodyRangeRatio, bodyPricePct, open, high, low, close, meanPrice };
   }
 
-  // split batches
-  function splitBatches(arr, size){ const out=[]; for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i,i+size)); return out; }
+  // Process symbols in batches with concurrency and delay to respect limits.
+  async function processSymbols(symbols, options){
+    const {
+      batchSize = 30,
+      concurrency = 3,
+      delayMs = 600,
+      bodyRangeMax = 0.25,
+      bodyPriceMax = 0.002,
+      testMode = false
+    } = options;
 
-  // start test (first N symbols) or all
-  async function start(useTest){
-    if(running){ uiLog('Already running — stop first','warn'); return; }
-    uiLog('Starting detector (fetching symbols) ...');
-    batchesContainer.innerHTML = '';
-    signalsEl.innerHTML = '';
-    logEl.innerHTML = '';
-    try{
-      allSymbols = await fetchPerpSymbols();
-      uiLog(`Fetched ${allSymbols.length} perp-USDT symbols.`);
-      infoEl.textContent = `Found ${allSymbols.length} symbols.`;
-    }catch(err){
-      uiLog('Cannot start — exchangeInfo fetch failed. Serve file over http and check CORS/network.', 'err');
-      return;
-    }
+    // if testMode, reduce payload
+    if(testMode) symbols = symbols.slice(0, 6);
 
-    const interval = document.getElementById('interval').value || '5m';
-    const lookback = Math.max(6, parseInt(document.getElementById('lookback').value)||24);
-    const stdTh = parseFloat(document.getElementById('stdTh').value)||0.004;
-    const batchSize = Math.max(6, parseInt(document.getElementById('batchSize').value)||60);
-    const maxConcurrent = Math.max(1, parseInt(document.getElementById('maxConcurrent').value)||4);
+    uiLog(`Processing ${symbols.length} symbols (batch ${batchSize}, concurrency ${concurrency}, delay ${delayMs}ms)`);
 
-    let batches = splitBatches(allSymbols, batchSize);
-    if(useTest){
-      // use only first batch and limit to 6 symbols (fast verification)
-      const sample = allSymbols.slice(0,6);
-      batches = [sample];
-      uiLog('Running in TEST mode (first 6 symbols).');
-    } else {
-      uiLog(`Creating ${batches.length} batches (batchSize ${batchSize}, maxConcurrent ${maxConcurrent})`);
-    }
+    // split into batches of batchSize
+    const batches = [];
+    for(let i=0;i<symbols.length;i+=batchSize) batches.push(symbols.slice(i, i+batchSize));
 
-    // open batches gradually, maxConcurrent at a time
-    running = true;
-    connections = [];
+    // queue batches and process with concurrency
+    let active = 0;
     let idx = 0;
-    async function openNextBatch(){
-      if(!running) return;
-      if(idx >= batches.length) {
-        uiLog('All requested batches scheduled.');
-        return;
-      }
-      const nextBatches = [];
-      for(let c=0; c<maxConcurrent && idx < batches.length; c++, idx++){
-        nextBatches.push({batchIdx: idx+1, symbols: batches[idx]});
-      }
-      // open these concurrently
-      for(const b of nextBatches){
-        try{
-          const conn = createWsForBatch(b.symbols, interval, stdTh, lookback, b.batchIdx);
-          connections.push(conn);
-          // small delay between opens to reduce burst
-          await new Promise(r=>setTimeout(r, 700));
-        }catch(err){
-          uiLog(`Failed to open batch ${b.batchIdx}: ${err.message}`,'err');
+    abortRequested = false;
+
+    return new Promise((resolve) => {
+      async function next(){
+        if(abortRequested){
+          uiLog('Abort requested — stopping processing.', true);
+          return resolve();
+        }
+        if(idx >= batches.length && active === 0){
+          uiLog('All batches processed.');
+          return resolve();
+        }
+        while(active < concurrency && idx < batches.length){
+          const batch = batches[idx++];
+          active++;
+          (async (batchSymbols, batchIndex) => {
+            try{
+              uiLog(`Batch ${batchIndex+1}/${batches.length}: ${batchSymbols.length} symbols — fetching klines...`);
+              // process each symbol in this batch sequentially (safer for weight)
+              for(const sym of batchSymbols){
+                if(abortRequested) break;
+                try{
+                  const klines = await fetchDailyKlines(sym, 3);
+                  // we want the previous closed candle: last closed is klines[klines.length-2] if last is current in-progress (unlikely for 1d if today not closed)
+                  // Klines returned are closed candles; for safety we'll pick second-last if length>=2 else last
+                  let closedIdx = klines.length - 2;
+                  if(closedIdx < 0) closedIdx = klines.length - 1;
+                  const prev = klines[closedIdx];
+                  const res = isDojiFromKline(prev, bodyRangeMax, bodyPriceMax);
+                  if(res.isDoji){
+                    showResult(`${sym} — DOJI prev day. open=${res.open} close=${res.close} body=${res.body.toFixed(6)} range=${res.range.toFixed(6)} body/range=${res.bodyRangeRatio.toFixed(3)} body/price=${(res.bodyPricePct*100).toFixed(3)}%`, true);
+                  } else {
+                    // only log summarized non-doji to avoid noise
+                    uiLog(`${sym} — not doji (body/range:${res.bodyRangeRatio.toFixed(3)}, body/price:${(res.bodyPricePct*100).toFixed(3)}%)`);
+                  }
+                }catch(errSym){
+                  uiLog(`Error fetching ${sym}: ${errSym.message||errSym}`, true);
+                }
+                // tiny pause between symbol REST calls inside batch to spread the requests
+                await new Promise(r => setTimeout(r, Math.max(40, Math.floor(delayMs / Math.max(1, batchSymbols.length)))));
+              }
+
+            }catch(errBatch){
+              uiLog(`Batch ${batchIndex+1} failed: ${errBatch.message||errBatch}`, true);
+            } finally {
+              active--;
+              // wait a small delay after batch to avoid bursts when opening next
+              await new Promise(r => setTimeout(r, delayMs));
+              next();
+            }
+          })(batch, idx-1);
         }
       }
-      // schedule next open after a short pause
-      if(idx < batches.length) setTimeout(openNextBatch, 1500);
-    }
-    openNextBatch();
-
-    // periodic heartbeat so UI shows alive even if no detections
-    const hb = setInterval(()=>{
-      if(!running) clearInterval(hb);
-      uiLog(`Heartbeat — active connections: ${connections.length}`);
-    }, 45000);
+      next();
+    });
   }
 
-  // stop everything
+  async function startTest(){
+    if(running){ uiLog('Already running. Stop first.', true); return; }
+    running = true;
+    uiLog('Starting TEST (first 6 symbols) doji scan...');
+    try{
+      const syms = await fetchPerpSymbols();
+      uiLog(`Got ${syms.length} symbols. Running test on first 6.`);
+      const options = {
+        batchSize: 6,
+        concurrency: 1,
+        delayMs: 400,
+        bodyRangeMax: parseFloat(document.getElementById('bodyRangeMax').value) || 0.25,
+        bodyPriceMax: parseFloat(document.getElementById('bodyPriceMax').value) || 0.002,
+        testMode: true
+      };
+      await processSymbols(syms, options);
+    }catch(err){
+      uiLog('Failed to run test: ' + (err.message||err), true);
+    } finally { running=false; uiLog('Test finished.'); }
+  }
+
+  async function startAll(){
+    if(running){ uiLog('Already running. Stop first.', true); return; }
+    running = true;
+    uiLog('Starting FULL doji scan across USDT perpetuals...');
+    try{
+      const syms = await fetchPerpSymbols();
+      uiLog(`Found ${syms.length} symbols. Beginning scan...`);
+      const options = {
+        batchSize: Math.max(8, parseInt(document.getElementById('batchSize').value) || 30),
+        concurrency: Math.max(1, parseInt(document.getElementById('concurrency').value) || 3),
+        delayMs: Math.max(200, parseInt(document.getElementById('delayMs').value) || 600),
+        bodyRangeMax: parseFloat(document.getElementById('bodyRangeMax').value) || 0.25,
+        bodyPriceMax: parseFloat(document.getElementById('bodyPriceMax').value) || 0.002,
+        testMode: false
+      };
+      await processSymbols(syms, options);
+    }catch(err){
+      uiLog('Failed to run full scan: ' + (err.message||err), true);
+    } finally { running=false; uiLog('Full scan finished.'); }
+  }
+
   function stop(){
+    abortRequested = true;
     running = false;
-    for(const c of connections){
-      try{ if(c.ws && c.ws.readyState === WebSocket.OPEN) c.ws.close(); }catch(e){}
-      if(c.statusEl && c.statusEl.parentNode) c.statusEl.parentNode.remove();
-    }
-    connections = [];
-    uiLog('Stopped all connections.');
+    uiLog('Stop requested. Current REST calls will finish then scanning will halt.');
   }
 
-  document.getElementById('startAll').onclick = ()=>start(false);
-  document.getElementById('startTest').onclick = ()=>start(true);
+  document.getElementById('startTest').onclick = startTest;
+  document.getElementById('startAll').onclick = startAll;
   document.getElementById('stop').onclick = stop;
 
-  uiLog('Detector ready. Click "Start (test 6)" to verify quickly. If nothing appears, open DevTools → Console and paste the first errors here.');
+  uiLog('Loaded. Use "Start (test 6)" to verify behavior quickly. Adjust thresholds (bodyRangeMax, bodyPriceMax) if you want looser/tighter doji detection.');
 })();
 </script>
 </body>

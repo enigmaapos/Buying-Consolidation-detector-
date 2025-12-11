@@ -1,10 +1,9 @@
 <!doctype html>
-
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Binance USDT-Perp Market Psychology Detector</title>
+  <title>Binance USDT-Perp Market Psychology Detector — Top30 Auto-refresh</title>
   <style>
     body{font-family:Inter,system-ui,Arial; background:#0f1720;color:#e6eef8;margin:12px}
     .card{background:#081028;border-radius:8px;padding:12px;margin:8px 0}
@@ -16,208 +15,419 @@
     .dist{background:#4a0f0f;color:#ffc6c6}
     .markup{background:#08305a;color:#bcd7ff}
     .markdown{background:#3a2a00;color:#ffe9a3}
+    .sideways{background:#2a2a2a;color:#cfd8e3}
+    .unknown{background:#444;color:#fff}
     .status{margin-top:8px;font-size:13px}
-    input,select{padding:6px;margin-right:6px}
+    input,select,button{padding:6px;margin-right:6px}
+    .warn{color:#ffd28a;font-size:13px;margin-top:6px}
+    .top-change{width:110px}
+    .search-row{display:flex;gap:8px;align-items:center;margin-top:8px}
+    .controls-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .small{font-size:12px;color:#9fb0cf}
   </style>
 </head>
 <body>
-  <h2>Binance USDT‑Perp Market Psychology Detector</h2>
+  <h2>Binance USDT-Perp Market Psychology Detector — Top 30 Auto-refresh</h2>
+
   <div class="card">
-    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <label>Timeframe:<select id="tf"><option>1m</option><option>5m</option><option>15m</option><option>1h</option><option>4h</option><option>1d</option></select></label>
-      <label>Batch size (symbols / websocket):<input type="number" id="batchSize" value="40" min="5" max="120"/></label>
-      <label>Klines to fetch for rules:<input type="number" id="lookback" value="100" min="20" max="2000"/></label>
+    <div class="controls-row">
+      <label>Timeframe:
+        <select id="tf"><option>1m</option><option>5m</option><option>15m</option><option>1h</option><option>4h</option><option>1d</option></select>
+      </label>
+
+      <label>Batch size (symbols / websocket):
+        <input type="number" id="batchSize" value="30" min="5" max="800"/>
+      </label>
+
+      <label>Klines lookback:
+        <input type="number" id="lookback" value="100" min="30" max="2000"/>
+      </label>
+
+      <label>Auto-refresh Top30 (seconds):
+        <input type="number" id="refreshInterval" value="300" min="60" max="3600"/>
+      </label>
+
       <button id="start">Start</button>
       <button id="stop">Stop</button>
+      <div class="small">Next refresh in <span id="countdown">—</span></div>
     </div>
+
     <div class="status" id="status">Idle</div>
-  </div>  <div class="card" id="controls" style="display:block">
-    <div style="margin-bottom:8px">Detected symbols (<span id="count">0</span>)</div>
-    <div style="max-height:60vh;overflow:auto">
-      <table id="table"><thead><tr><th>Symbol</th><th>Price</th><th>Phase</th><th>Reason</th></tr></thead><tbody></tbody></table>
+    <div class="warn" id="warn" style="display:none"></div>
+
+    <div class="search-row">
+      <label style="white-space:nowrap">Search other USDT-perp:</label>
+      <input id="search" list="others" placeholder="Type symbol e.g. DOGEUSDT" style="min-width:220px" />
+      <datalist id="others"></datalist>
+      <button id="check">Check</button>
+      <button id="refreshDatalist">Refresh symbol list</button>
+      <div id="searchResult" style="margin-left:12px;font-size:13px"></div>
     </div>
-  </div>  <script>
-  // This single-file demo shows a *safe-by-default* strategy to watch ALL USDT perpetual pairs
-  // without hammering Binance rate limits:
-  // 1) fetch /fapi/v1/exchangeInfo once (weight 1)
-  // 2) build the list of symbols ending with USDT (futures perpetuals)
-  // 3) for historical data (klines) we request in staggered batches with conservative LIMIT
-  //    (use LIMIT <= 100 to keep request weight low)
-  // 4) real-time updates via combined websocket streams, grouped into batches (batchSize)
-  // 5) if any 429 or rate-limit headers seen, we back off with exponential delay
-  // 6) a simple heuristic detects Accumulation / Distribution / Markup / Markdown
-  //    - low volatility + sideways + rising volume => Accumulation
-  //    - low volatility + sideways + falling volume => Distribution
-  //    - trending up with momentum => Markup
-  //    - trending down with momentum => Markdown
-  // Note: This is a front-end prototype. For production use, server-side aggregation + API keys may be required.
+  </div>
 
-  const API_BASE = 'https://fapi.binance.com';
-  let running = false;
-  let symbols = [];
-  let sockets = [];
-  let state = {};
+  <div class="card" id="controls" style="display:block">
+    <div style="margin-bottom:8px">Top 30 symbols by absolute 24h % move (<span id="count">0</span>)</div>
+    <div style="max-height:60vh;overflow:auto">
+      <table id="table"><thead><tr><th>Symbol</th><th class="top-change">24h %</th><th>Price</th><th>Phase</th><th>Reason</th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>
 
-  function setStatus(s){ document.getElementById('status').innerText = s }
+<script>
+/*
+  Top30 Auto-refresh Detector
+  - Tracks Top30 by absolute 24h percent change (auto-refresh interval).
+  - Only Top30 are monitored live to reduce footprint.
+  - Supports on-demand checks for other USDT-perps.
+  - Conservative throttling and exponential backoff implemented.
+*/
 
-  async function fetchExchangeInfo(){
-    setStatus('Fetching exchange info...')
-    const resp = await fetch(API_BASE + '/fapi/v1/exchangeInfo');
-    if(!resp.ok) throw new Error('exchangeInfo failed: '+resp.status);
-    const js = await resp.json();
-    // filter USDT perpetual symbols: in futures exchangeInfo, symbols with quoteAsset 'USDT' are usually USDT-M
-    const usdt = js.symbols.filter(s=>s.contractType && (s.symbol.endsWith('USDT') || s.quoteAsset==='USDT'))
-    return usdt.map(s=>s.symbol)
+const API_BASE = 'https://fapi.binance.com';
+let running = false;
+let allSymbols = [];
+let topSymbols = [];
+let sockets = [];
+let state = {};
+let refreshTimer = null;
+let countdownTimer = null;
+let nextRefreshAt = 0;
+
+// --------------- utilities ----------------
+function setStatus(s){ document.getElementById('status').innerText = s }
+function showWarn(s){ const w=document.getElementById('warn'); w.style.display = s ? 'block':'none'; w.innerText = s || '' }
+function formatPct(n){ if(n===null||n===undefined||isNaN(n)) return '-'; return Number(n).toFixed(2)+'%'; }
+function safeNumber(x){ return x === null || x === undefined ? 0 : Number(x); }
+
+// --------------- exchange helpers ----------------
+async function fetchExchangeInfo(){
+  setStatus('Fetching exchange info...');
+  const resp = await fetch(API_BASE + '/fapi/v1/exchangeInfo');
+  if(!resp.ok) throw new Error('exchangeInfo failed: '+resp.status);
+  const js = await resp.json();
+  const usdt = js.symbols.filter(s=> (s.contractType || s.isSpot !== undefined) && (s.symbol.endsWith('USDT') || s.quoteAsset==='USDT'));
+  return usdt.map(s=>s.symbol);
+}
+
+async function fetch24hr(){
+  setStatus('Fetching 24h ticker...');
+  const resp = await fetch(API_BASE + '/fapi/v1/ticker/24hr');
+  if(!resp.ok) throw new Error('ticker24 failed: '+resp.status);
+  return await resp.json();
+}
+
+// --------------- indicators ----------------
+function sma(arr, n){ if(!arr || arr.length<n) return null; const slice=arr.slice(-n).map(Number); return slice.reduce((a,b)=>a+b,0)/n }
+function stddev(arr, n){ if(!arr || arr.length<n) return null; const slice=arr.slice(-n).map(Number); const m=sma(slice,n); const v=slice.reduce((a,b)=>a+Math.pow(b-m,2),0)/n; return Math.sqrt(v) }
+function atr(highs,lows,closes,n=14){
+  if(!closes || closes.length<n) return null;
+  let trs=[];
+  for(let i=1;i<closes.length;i++){
+    const tr = Math.max(Math.abs(Number(highs[i]) - Number(lows[i])),
+                        Math.abs(Number(highs[i]) - Number(closes[i-1])),
+                        Math.abs(Number(lows[i]) - Number(closes[i-1])));
+    trs.push(tr);
   }
+  const last = trs.slice(-n);
+  const sum = last.reduce((a,b)=>a+b,0);
+  return sum / n;
+}
 
-  // small indicator library
-  function sma(arr, n){ if(arr.length<n) return null; const slice=arr.slice(-n); return slice.reduce((a,b)=>a+b,0)/n }
-  function stddev(arr, n){ if(arr.length<n) return null; const slice=arr.slice(-n); const m=sma(slice,n); const v=slice.reduce((a,b)=>a+Math.pow(b-m,2),0)/n; return Math.sqrt(v) }
-  function atr(highs,lows,closes,n=14){ if(closes.length<n) return null; let trs=[]; for(let i=1;i<closes.length;i++){ const tr=Math.max(highs[i]-lows[i], Math.abs(highs[i]-closes[i-1]), Math.abs(lows[i]-closes[i-1])); trs.push(tr) } let sum=trs.slice(-n).reduce((a,b)=>a+b,0); return sum/n }
+// --------------- phase detection (prototype) ----------------
+function detectPhase(klines){
+  if(!Array.isArray(klines) || klines.length<30) return {phase:'unknown',reason:'insufficient data'};
+  const closes = klines.map(k=>Number(k[4]));
+  const highs = klines.map(k=>Number(k[2]));
+  const lows  = klines.map(k=>Number(k[3]));
+  const vols  = klines.map(k=>Number(k[5]));
+  const sma20 = sma(closes,20);
+  const sma50 = sma(closes,50);
+  const volRecent = sma(vols,5);
+  const volPast = sma(vols,30);
+  const sd20 = stddev(closes,20);
+  const atr14 = atr(highs,lows,closes,14);
+  const last = closes[closes.length-1];
+  const prev = closes[Math.max(0,closes.length-6)];
+  const slope = prev !== 0 ? (last - prev)/prev : 0;
 
-  // simple psychology detector
-  function detectPhase(klines, volumes){
-    // klines: array of close prices (number)
-    if(klines.length<30) return {phase:'unknown',reason:'insufficient data'}
-    const closes = klines.map(k=>k[4]); // close price
-    const highs = klines.map(k=>k[2]);
-    const lows = klines.map(k=>k[3]);
-    const vols = volumes || klines.map(k=>k[5]);
-    const sma20 = sma(closes,20);
-    const sma50 = sma(closes,50);
-    const volRecent = sma(vols,5);
-    const volPast = sma(vols,30);
-    const sd20 = stddev(closes,20);
-    const atr14 = atr(highs,lows,closes,14);
-    const last = parseFloat(closes[closes.length-1]);
-    const prev = parseFloat(closes[closes.length-6]);
-    const slope = (last - prev)/prev;
+  const compression = (atr14 && (atr14/last) < 0.006) || (sd20 && (sd20/last) < 0.004);
+  const volRising = volRecent && volPast && (volRecent > volPast*1.15);
+  const volFalling = volRecent && volPast && (volRecent < volPast*0.85);
 
-    // compression: low volatility relative to price
-    const compression = (atr14 && (atr14/last) < 0.006) || (sd20 && (sd20/last) < 0.004);
-    const volRising = volRecent && volPast && (volRecent > volPast*1.15);
-    const volFalling = volRecent && volPast && (volRecent < volPast*0.85);
+  // rules (prototype)
+  if(compression && volRising && slope>0) return {phase:'Accumulation', reason:'low volatility + rising volume + slight upward bias'};
+  if(compression && volFalling && slope<=0) return {phase:'Distribution', reason:'low volatility + falling volume + no upward bias'};
+  if(slope>0.02 || (sma20 && sma50 && sma20 > sma50)) return {phase:'Markup', reason:'strong upward momentum / above mid-term avg'};
+  if(slope<-0.02 || (sma20 && sma50 && sma20 < sma50)) return {phase:'Markdown', reason:'strong downward momentum / below mid-term avg'};
 
-    if(compression && volRising && slope>0) return {phase:'Accumulation','reason':'low volatility + volume rising + slight upward bias'}
-    if(compression && volFalling && slope<=0) return {phase:'Distribution','reason':'low volatility + volume falling + no upward bias'}
-    if(slope>0.02 || (sma20 && sma50 && sma20> s ma50)) return {phase:'Markup','reason':'strong upward momentum'}
-    if(slope<-0.02 || (sma20 && sma50 && sma20< s ma50)) return {phase:'Markdown','reason':'strong downward momentum'}
-
-    // fallback: look at trend relative to sma50
-    if(sma20 && sma50){
-      if(sma20 > sma50) return {phase:'Markup','reason':'price above mid-term average'}
-      if(sma20 < sma50) return {phase:'Markdown','reason':'price below mid-term average'}
-    }
-
-    return {phase:'Sideways','reason':'no clear momentum or compression signals'}
+  if(sma20 && sma50){
+    if(sma20 > sma50) return {phase:'Markup', reason:'price above mid-term average'};
+    if(sma20 < sma50) return {phase:'Markdown', reason:'price below mid-term average'};
   }
+  return {phase:'Sideways', reason:'no clear momentum or compression signals'};
+}
 
-  // SAFE fetch for klines with throttling and backoff
-  async function safeFetchKlines(symbol, interval, limit=100){
-    const url = `${API_BASE}/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-    let tries=0;
-    while(tries<5){
-      try{
-        const resp = await fetch(url);
-        if(resp.status===429 || resp.status===418){
-          const wait = (Math.pow(2,tries)+1)*1000;
-          console.warn('rate limited, backing off',wait);
-          await new Promise(r=>setTimeout(r,wait));
-          tries++; continue;
-        }
-        if(!resp.ok) throw new Error('klines failed:'+resp.status);
-        return await resp.json();
-      }catch(e){
-        console.error('klines fetch error',e);
-        const wait = (Math.pow(2,tries)+1)*1000;
-        await new Promise(r=>setTimeout(r,wait));
-        tries++;
+// --------------- safe REST fetch with exponential backoff ----------------
+async function safeFetch(url, opts={}, maxTries=5){
+  let tries = 0;
+  while(tries < maxTries){
+    try{
+      const resp = await fetch(url, opts);
+      if(resp.status === 429 || resp.status === 418){
+        const wait = (Math.pow(2,tries)+1) * 1000;
+        console.warn('rate limited, backing off', wait);
+        await new Promise(r=>setTimeout(r, wait));
+        tries++; continue;
       }
+      if(!resp.ok) throw new Error('request failed: '+resp.status);
+      return await resp.json();
+    }catch(err){
+      console.warn('fetch error', err);
+      const wait = (Math.pow(2,tries)+1) * 1000;
+      await new Promise(r=>setTimeout(r, wait));
+      tries++;
     }
-    throw new Error('klines fetch failed after retries');
   }
+  throw new Error('fetch failed after retries');
+}
 
-  function addRow(symbol, price, phase, reason){
-    const tbody = document.querySelector('#table tbody');
-    let row = document.getElementById('r-'+symbol);
-    if(!row){ row = document.createElement('tr'); row.id = 'r-'+symbol; row.innerHTML = `<td>${symbol}</td><td class="price"></td><td class="phase"></td><td class="reason"></td>`; tbody.appendChild(row); }
-    row.querySelector('.price').innerText = price;
-    const pcell = row.querySelector('.phase');
-    pcell.innerText = phase;
-    pcell.className = 'phase chip ' + (phase.toLowerCase());
-    row.querySelector('.reason').innerText = reason;
+async function safeFetchKlines(symbol, interval, limit=100){
+  const url = `${API_BASE}/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+  return await safeFetch(url);
+}
+
+// --------------- DOM helpers ----------------
+function clearTable(){ const tbody=document.querySelector('#table tbody'); tbody.innerHTML=''; }
+function addRow(symbol, pct24, price, phase, reason){
+  const tbody = document.querySelector('#table tbody');
+  let row = document.getElementById('r-'+symbol);
+  if(!row){
+    row = document.createElement('tr'); row.id = 'r-'+symbol;
+    row.innerHTML = `<td>${symbol}</td><td class="top-change"></td><td class="price"></td><td class="phase"></td><td class="reason"></td>`;
+    tbody.appendChild(row);
   }
+  row.querySelector('.top-change').innerText = formatPct(pct24);
+  row.querySelector('.price').innerText = price;
+  const pcell = row.querySelector('.phase');
+  pcell.innerText = phase;
+  const cls = phase.toLowerCase().replace(/\s+/g,'') || 'unknown';
+  pcell.className = 'phase chip ' + cls;
+  row.querySelector('.reason').innerText = reason;
+}
 
-  async function start(){
-    if(running) return; running=true; setStatus('Starting...');
-    const tf = document.getElementById('tf').value;
-    const batchSize = parseInt(document.getElementById('batchSize').value,10)||40;
-    const lookback = parseInt(document.getElementById('lookback').value,10)||100;
+// --------------- websocket management ----------------
+function closeAllSockets(){
+  sockets.forEach(ws=>{
+    try{ ws.close(); }catch(e){}
+  });
+  sockets = [];
+}
 
-    symbols = await fetchExchangeInfo();
-    document.getElementById('count').innerText = symbols.length;
-    setStatus('Got '+symbols.length+' symbols. Preparing batches...');
+function openBatchedWebsockets(symbolsList, tf, batchSize){
+  // close previous sockets first
+  closeAllSockets();
+  // create batches and open combined streams
+  const batches = [];
+  for(let i=0;i<symbolsList.length;i+=batchSize) batches.push(symbolsList.slice(i,i+batchSize));
 
-    // build batches
-    const batches = [];
-    for(let i=0;i<symbols.length;i+=batchSize) batches.push(symbols.slice(i,i+batchSize));
-
-    // for each symbol fetch historical klines but stagger the requests (conservative)
-    setStatus('Fetching historical klines (staggered). This may take some time depending on symbol count.');
-    for(let i=0;i<symbols.length;i++){
-      const sym = symbols[i];
-      try{
-        // stagger 200ms per symbol (very conservative). You can increase concurrency with a server-side worker.
-        await new Promise(r=>setTimeout(r,200));
-        const klines = await safeFetchKlines(sym, tf, Math.min(lookback,100));
-        const det = detectPhase(klines);
-        const price = klines[klines.length-1][4];
-        state[sym] = {klines,phase:det.phase,reason:det.reason,price};
-        addRow(sym,price,det.phase,det.reason);
-      }catch(e){ console.warn('hist fail',sym,e); addRow(sym,'-','error','history fetch failed') }
-    }
-
-    setStatus('Connecting websockets in '+batches.length+' batches...');
-
-    // for real-time, open combined streams per batch
-    for(let b=0;b<batches.length;b++){
-      const list = batches[b];
-      // build stream path like btcusdt@kline_1m/ethusdt@kline_1m
-      const streams = list.map(s=>s.toLowerCase()+'@kline_'+tf).join('/');
-      const url = `wss://fstream.binance.com/stream?streams=${streams}`;
-      // delay between opening connections to avoid connection storms
-      await new Promise(r=>setTimeout(r,500*(b%3+1)));
+  batches.forEach((batch, idx) =>{
+    // build stream string
+    const streams = batch.map(s=>s.toLowerCase()+'@kline_'+tf).join('/');
+    const url = `wss://fstream.binance.com/stream?streams=${streams}`;
+    try{
       const ws = new WebSocket(url);
-      sockets.push(ws);
-      ws.onopen = ()=>console.log('ws open',b,list.length);
+      ws.onopen = ()=>console.log('ws open batch', idx, batch.length);
       ws.onmessage = (ev)=>{
-        const data = JSON.parse(ev.data);
-        // combined stream returns {stream, data}
-        const payload = data.data || data;
-        if(payload && payload.k){
-          const k = payload.k; // kline object
-          const sym = k.s;
-          const close = k.c;
-          // update stored klines (keep max lookback)
-          if(state[sym] && state[sym].klines){
-            state[sym].klines.push([k.t,k.o,k.h,k.l,k.c,k.v]);
-            if(state[sym].klines.length>200) state[sym].klines.shift();
-            const det = detectPhase(state[sym].klines);
-            state[sym].phase = det.phase; state[sym].reason = det.reason; state[sym].price = close;
-            addRow(sym,close,det.phase,det.reason);
+        try{
+          const data = JSON.parse(ev.data);
+          const payload = data.data || data;
+          if(payload && payload.k){
+            const k = payload.k;
+            const sym = k.s;
+            const close = k.c;
+            if(state[sym] && state[sym].klines){
+              state[sym].klines.push([k.t,k.o,k.h,k.l,k.c,k.v]);
+              if(state[sym].klines.length>500) state[sym].klines.shift();
+              const det = detectPhase(state[sym].klines);
+              state[sym].phase = det.phase; state[sym].reason = det.reason; state[sym].price = close;
+              addRow(sym, state[sym].pct24, close, det.phase, det.reason);
+            }
           }
-        }
-      }
-      ws.onerror = (e)=>console.warn('ws err',e);
-      ws.onclose = ()=>console.log('ws closed',b);
+        }catch(e){ console.error('ws message parse', e); }
+      };
+      ws.onerror = (e)=> console.warn('ws err', e);
+      ws.onclose = ()=> console.log('ws closed batch', idx);
+      sockets.push(ws);
+    }catch(e){
+      console.warn('ws connection failed', e);
     }
+  });
+}
 
-    setStatus('Running — live updates active. Watch the table.')
+// --------------- Top30 flow ----------------
+async function computeTop30AndPopulate(tf, lookback, batchSize){
+  // fetch exchange info & 24h tickers
+  setStatus('Computing Top30...');
+  const tickers = await fetch24hr();
+  // ensure allSymbols is present (should be fetched previously)
+  if(!allSymbols || allSymbols.length===0) allSymbols = await fetchExchangeInfo();
+
+  // filter tickers for USDT-perp symbols only
+  const filtered = tickers.filter(t=> allSymbols.includes(t.symbol));
+  filtered.forEach(t => t.absChange = Math.abs(Number(t.priceChangePercent || 0)));
+  filtered.sort((a,b)=> b.absChange - a.absChange);
+
+  const top = filtered.slice(0,30).map(t=>t.symbol);
+  // if same as current topSymbols, return false (no-change)
+  const same = top.length === topSymbols.length && top.every((s,i)=> s === topSymbols[i]);
+  topSymbols = top;
+
+  // populate 'others' datalist
+  const others = allSymbols.filter(s=> !topSymbols.includes(s)).sort();
+  const dl = document.getElementById('others'); dl.innerHTML = '';
+  others.forEach(s=>{ const opt=document.createElement('option'); opt.value=s; dl.appendChild(opt); });
+
+  document.getElementById('count').innerText = topSymbols.length;
+
+  // fetch historical klines for topSymbols (staggered)
+  setStatus('Fetching historical klines for Top30 (staggered)...');
+  clearTable();
+  // map ticker 24h pct for quick lookup
+  const pctMap = {};
+  filtered.forEach(t => { pctMap[t.symbol] = Number(t.priceChangePercent || 0); });
+
+  for(let i=0;i<topSymbols.length;i++){
+    const sym = topSymbols[i];
+    try{
+      // stagger 150ms per symbol to be conservative
+      await new Promise(r=>setTimeout(r,150));
+      const klines = await safeFetchKlines(sym, tf, Math.min(lookback, 200));
+      const det = detectPhase(klines);
+      const price = klines[klines.length-1][4];
+      const pct24 = pctMap[sym] !== undefined ? pctMap[sym] : null;
+      state[sym] = { klines, phase: det.phase, reason: det.reason, price, pct24 };
+      addRow(sym, pct24, price, det.phase, det.reason);
+    }catch(e){
+      console.warn('history fetch failed for', sym, e);
+      addRow(sym, null, '-', 'error', 'history fetch failed');
+    }
   }
 
-  function stop(){ running=false; setStatus('Stopping — closing sockets'); sockets.forEach(s=>s.close()); sockets=[] }
+  return same; // whether unchanged (true) or changed (false)
+}
 
-  document.getElementById('start').addEventListener('click', ()=>start().catch(e=>setStatus('Error: '+e.message)));
-  document.getElementById('stop').addEventListener('click', ()=>stop());
-  </script></body>
+// --------------- auto-refresh control ----------------
+function startCountdown(seconds){
+  clearInterval(countdownTimer);
+  nextRefreshAt = Date.now() + seconds * 1000;
+  document.getElementById('countdown').innerText = `${seconds}s`;
+  countdownTimer = setInterval(()=>{
+    const left = Math.max(0, Math.round((nextRefreshAt - Date.now())/1000));
+    document.getElementById('countdown').innerText = `${left}s`;
+  }, 1000);
+}
+
+async function start(){
+  if(running) return;
+  running = true;
+  setStatus('Starting Top30 detector...');
+  showWarn('');
+  const tf = document.getElementById('tf').value;
+  const batchSize = Math.max(5, Math.min(800, parseInt(document.getElementById('batchSize').value,10) || 30));
+  const lookback = Math.max(30, parseInt(document.getElementById('lookback').value,10) || 100);
+  const refreshInterval = Math.max(60, parseInt(document.getElementById('refreshInterval').value,10) || 300);
+
+  try{
+    // initial symbol list
+    allSymbols = await fetchExchangeInfo();
+
+    // initial compute
+    const unchanged = await computeTop30AndPopulate(tf, lookback, batchSize);
+
+    // open websockets for current topSymbols
+    openBatchedWebsockets(topSymbols, tf, batchSize);
+
+    setStatus('Running — Top30 live. Auto-refresh every '+refreshInterval+'s.');
+    startCountdown(refreshInterval);
+
+    // schedule auto-refresh loop
+    refreshTimer = setInterval(async ()=>{
+      setStatus('Auto-refreshing Top30...');
+      try{
+        const unchanged = await computeTop30AndPopulate(tf, lookback, batchSize);
+        if(unchanged){
+          // top30 didn't change: we keep existing sockets (but we can optionally re-open to refresh)
+          setStatus('Top30 refreshed: no symbol changes — live continues.');
+        } else {
+          // top30 changed: re-open sockets for new topSymbols
+          setStatus('Top30 changed — re-opening websockets for new Top30.');
+          openBatchedWebsockets(topSymbols, tf, batchSize);
+        }
+      }catch(e){
+        console.warn('auto-refresh error', e);
+        showWarn('Auto-refresh failed: '+e.message);
+      }
+      startCountdown(refreshInterval);
+    }, refreshInterval * 1000);
+
+  }catch(e){
+    setStatus('Start error: '+e.message);
+    running = false;
+  }
+}
+
+function stop(){
+  if(!running) return;
+  running = false;
+  setStatus('Stopping — closing sockets and timers');
+  closeAllSockets();
+  if(refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+  if(countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; document.getElementById('countdown').innerText = '—'; }
+}
+
+// --------------- on-demand check for other symbols ----------------
+document.getElementById('check').addEventListener('click', async ()=>{
+  const sym = document.getElementById('search').value.trim().toUpperCase();
+  const dst = document.getElementById('searchResult'); dst.innerText = '';
+  if(!sym){ dst.innerText = 'Type a symbol'; return; }
+  if(!allSymbols || allSymbols.length===0){ dst.innerText = 'Please Start to load symbol list first'; return; }
+  if(!allSymbols.includes(sym)){ dst.innerText = 'Symbol not found in USDT-perps'; return; }
+
+  try{
+    setStatus('On-demand fetching '+sym+' ...');
+    const tf = document.getElementById('tf').value;
+    // conservative fetch: limit 200
+    const klines = await safeFetchKlines(sym, tf, 200);
+    const det = detectPhase(klines);
+    const price = klines[klines.length-1][4];
+    dst.innerText = `${sym} — ${price} — ${det.phase}: ${det.reason}`;
+  }catch(e){
+    dst.innerText = 'Check failed: ' + e.message;
+  } finally {
+    setStatus('Idle (on-demand complete)');
+  }
+});
+
+// manual refresh datalist
+document.getElementById('refreshDatalist').addEventListener('click', async ()=>{
+  try{
+    setStatus('Refreshing symbol list...');
+    allSymbols = await fetchExchangeInfo();
+    // rebuild datalist using current topSymbols (if any)
+    const others = (allSymbols || []).filter(s => !topSymbols.includes(s)).sort();
+    const dl = document.getElementById('others'); dl.innerHTML = '';
+    others.forEach(s=>{ const opt=document.createElement('option'); opt.value=s; dl.appendChild(opt); });
+    setStatus('Symbol list refreshed.');
+  }catch(e){
+    setStatus('Refresh failed: ' + e.message);
+  }
+});
+
+// start/stop buttons
+document.getElementById('start').addEventListener('click', ()=> start().catch(e=> setStatus('Start error: '+e.message)));
+document.getElementById('stop').addEventListener('click', ()=> stop());
+
+// clean up on page unload
+window.addEventListener('beforeunload', ()=>{ stop(); });
+
+</script>
+</body>
 </html>
